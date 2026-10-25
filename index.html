@@ -298,6 +298,7 @@
         <div class="form-row">
           <label for="mapping-mode" data-i18n="labels.mode">Mode</label>
           <select id="mapping-mode">
+            <option value="7" hidden disabled data-i18n-opt="projection.surfaceNormal">Surface normal</option>
             <option value="5" selected data-i18n-opt="projection.triplanar">Triplanar</option>
             <option value="6" data-i18n-opt="projection.cubic">Cubic (Box)</option>
             <option value="3" data-i18n-opt="projection.cylindrical">Cylindrical</option>
@@ -348,7 +349,7 @@
             <button id="stamp-mode-btn" type="button" class="cylinder-axis-btn" aria-pressed="false"
               data-i18n="ui.stampMode"
               data-i18n-title="tooltips.stamp"
-              title="Apply the texture once instead of tiling it, for logos, badges and labels. Click the model to position it; Size U and V set its size. Only the Planar and Cylindrical projections are available while it is on.">Stamp mode</button>
+              title="Apply the texture once instead of tiling it, for logos, badges and labels. Click the model to position it; Size U and V set its size. While it is on, only the Surface normal, Planar and Cylindrical projections are available; Surface normal lines the stamp up with the surface under its centre.">Stamp mode</button>
           </div>
         </div>
         <div class="form-row" id="stamp-place-row" style="display:none">

@@ -14,6 +14,7 @@ export const MODE_CYLINDRICAL = 3;
 export const MODE_SPHERICAL   = 4;
 export const MODE_TRIPLANAR   = 5;
 export const MODE_CUBIC       = 6;
+export const MODE_SURFACE_NORMAL = 7;   // stamps only
 
 /** Texture layers the preview can composite at once (one vec4 attribute channel each). */
 export const MAX_LAYERS = 4;
@@ -63,6 +64,14 @@ const sharedGLSL = /* glsl */`
   uniform vec4      layerStamp[MAX_LAYERS];     // stamp: xyz = centre (model mm), w = facing side ±1; w = 0 → tiled
   uniform vec4      layerStampSize[MAX_LAYERS]; // stamp: xy = footprint (mm), zw = height map size (texels)
   uniform vec2      layerStampFade[MAX_LAYERS]; // stamp: x = Smooth Mask distance (mm), y = curve (FALLOFF_CURVE_INDEX)
+  uniform vec4      layerStampDepth[MAX_LAYERS]; // stamp occlusion: x = has a depth map, y = texel (mm), zw = size (texels)
+  uniform vec3      layerStampNormal[MAX_LAYERS]; // surface-normal stamp: projection normal
+  uniform vec3      layerStampAxisU[MAX_LAYERS];  // … and its image right / up axes (mapping.js stampAxes)
+  uniform vec3      layerStampAxisV[MAX_LAYERS];
+  uniform sampler2D stampDepth0;                 // per-layer depth maps (mapping.js buildStampDepth)
+  uniform sampler2D stampDepth1;
+  uniform sampler2D stampDepth2;
+  uniform sampler2D stampDepth3;
   uniform vec3      boundsMin;
   uniform vec3      boundsSize;
   uniform vec3      boundsCenter;
@@ -147,7 +156,11 @@ const sharedGLSL = /* glsl */`
     int mode = layerMode[l];
     vec2 d;
     float facing;
-    if (mode == 0) {
+    if (mode == 7) {
+      vec3 rel = pos - st.xyz;
+      d = vec2(dot(rel, layerStampAxisU[l]), dot(rel, layerStampAxisV[l]));
+      facing = dot(n, layerStampNormal[l]);
+    } else if (mode == 0) {
       d = pos.xy - st.xy; facing = n.z * side;
       if (side < 0.0) d.x = -d.x;
     } else if (mode == 1) {
@@ -171,8 +184,42 @@ const sharedGLSL = /* glsl */`
     return vec3(d / layerStampSize[l].xy + 0.5, facing);
   }
 
+  // Stamp occlusion — mirrors _stampHeight / _stampOccluded in mapping.js.
+  const float STAMP_DEPTH_TOL = 0.05;
+  // Single-return helpers: HLSL (ANGLE D3D11) warns about multi-return ones.
+  float stampHeight(int l, vec3 pos) {
+    int mode = layerMode[l];
+    float h;
+    if      (mode == 7) h = dot(pos, layerStampNormal[l]);
+    else if (mode == 0) h = pos.z;
+    else if (mode == 1) h = pos.y;
+    else if (mode == 2) h = pos.x;
+    else                h = length(pos.xy - layerCylCenter[l]);
+    return h * layerStamp[l].w;
+  }
+  // Explicit LOD: looked up inside branches, where implicit derivatives are undefined.
+  float stampDepthAt(int l, vec2 tc) {
+    float d;
+    if      (l == 0) d = textureLod(stampDepth0, tc, 0.0).r;
+    else if (l == 1) d = textureLod(stampDepth1, tc, 0.0).r;
+    else if (l == 2) d = textureLod(stampDepth2, tc, 0.0).r;
+    else             d = textureLod(stampDepth3, tc, 0.0).r;
+    return d;
+  }
+  // f = stampFrame(): true when a surface nearer the stamp side hides pos.
+  bool stampOccluded(int l, vec3 pos, vec3 f) {
+    vec4 sd = layerStampDepth[l];
+    if (sd.x < 0.5) return false;
+    vec2 idx = min(floor(clamp(f.xy, 0.0, 1.0) * sd.zw), sd.zw - 1.0);
+    float D = stampDepthAt(l, (idx + 0.5) / sd.zw);
+    float fc = max(f.z, STAMP_FACING_LO);
+    float tol = STAMP_DEPTH_TOL + sd.y * sqrt(max(0.0, 1.0 - fc * fc)) / fc;
+    return stampHeight(l, pos) < D - tol;
+  }
+
   // Layer l's coverage: 1 for tiled layers; for a stamp, its footprint times
-  // the facing fade, ramping up from the footprint's edge with a Smooth Mask.
+  // the facing fade, ramping up from the footprint's edge with a Smooth Mask,
+  // and 0 where a nearer surface hides the point.
   float stampCover(int l, vec3 pos, vec3 n) {
     if (layerStamp[l].w == 0.0) return 1.0;
     vec3 f = stampFrame(l, pos, n);
@@ -188,6 +235,7 @@ const sharedGLSL = /* glsl */`
       else if (curve == 2.0) t = t * t;
       cover *= t;
     }
+    if (cover > 0.0 && stampOccluded(l, pos, f)) cover = 0.0;
     return cover;
   }
 
@@ -605,8 +653,9 @@ export function createPreviewMaterial(layers, settings) {
  *   offsetU, offsetV, rotation, amplitude, symmetricDisplacement,
  *   mappingBlend, seamBandWidth, capAngle, cylinderCenterX, cylinderCenterY,
  *   cylinderRadius, textureAspectU, textureAspectV, blendAdd, stampOnce,
- *   stampCenterX/Y/Z, stampSide, mapWidth, mapHeight (height map texels),
- *   boundaryFalloff, boundaryFalloffCurve (the stamp's edge fade) }
+ *   stampCenterX/Y/Z, stampSide, stampNormalX/Y/Z, mapWidth, mapHeight (height map texels),
+ *   boundaryFalloff, boundaryFalloffCurve (the stamp's edge fade),
+ *   stampDepth ({ depth, texture } occlusion map, main.js _stampDepthFor) }
  * @param {object} settings  { bounds, bottomAngleLimit, topAngleLimit,
  *   noDownwardZ, useDisplacement, activeLayer (index into `layers`),
  *   boundaryFalloff, boundaryFalloffCurve (the active layer's, for the
@@ -654,12 +703,25 @@ export function updateMaterial(material, layers, settings) {
     u.layerStamp.value[l * 4 + 1] = st ? st.cy : 0;
     u.layerStamp.value[l * 4 + 2] = st ? st.cz : 0;
     u.layerStamp.value[l * 4 + 3] = st ? st.side : 0;
+    for (let k = 0; k < 3; k++) {
+      u.layerStampNormal.value[l * 3 + k] = st ? st['n' + 'xyz'[k]] : 0;
+      u.layerStampAxisU.value[l * 3 + k]  = st ? st['u' + 'xyz'[k]] : 0;
+      u.layerStampAxisV.value[l * 3 + k]  = st ? st['v' + 'xyz'[k]] : 0;
+    }
     u.layerStampSize.value[l * 4]     = st ? st.sizeU : 1;
     u.layerStampSize.value[l * 4 + 1] = st ? st.sizeV : 1;
     u.layerStampSize.value[l * 4 + 2] = L ? Math.max(L.mapWidth ?? 1, 1) : 1;
     u.layerStampSize.value[l * 4 + 3] = L ? Math.max(L.mapHeight ?? 1, 1) : 1;
     u.layerStampFade.value[l * 2]     = st ? st.fade : 0;
     u.layerStampFade.value[l * 2 + 1] = st ? (FALLOFF_CURVE_INDEX[st.fadeCurve] ?? 0) : 0;
+    const sd = st && L.stampDepth ? L.stampDepth : null;
+    const depthU = u['stampDepth' + l];
+    const depthTex = sd ? sd.texture : _fallbackDepthTexture();
+    if (depthU.value !== depthTex) depthU.value = depthTex;
+    u.layerStampDepth.value[l * 4]     = sd ? 1 : 0;
+    u.layerStampDepth.value[l * 4 + 1] = sd ? sd.depth.texel : 0;
+    u.layerStampDepth.value[l * 4 + 2] = sd ? sd.depth.nu : 1;
+    u.layerStampDepth.value[l * 4 + 3] = sd ? sd.depth.nv : 1;
   }
   u.boundsMin.value.copy(b.min);
   u.boundsSize.value.copy(b.size);
@@ -699,6 +761,14 @@ function buildUniforms() {
     layerStamp:     { value: new Float32Array(MAX_LAYERS * 4) },
     layerStampSize: { value: new Float32Array(MAX_LAYERS * 4) },
     layerStampFade: { value: new Float32Array(MAX_LAYERS * 2) },
+    layerStampDepth: { value: new Float32Array(MAX_LAYERS * 4) },
+    layerStampNormal: { value: new Float32Array(MAX_LAYERS * 3) },
+    layerStampAxisU:  { value: new Float32Array(MAX_LAYERS * 3) },
+    layerStampAxisV:  { value: new Float32Array(MAX_LAYERS * 3) },
+    stampDepth0:    { value: _fallbackDepthTexture() },
+    stampDepth1:    { value: _fallbackDepthTexture() },
+    stampDepth2:    { value: _fallbackDepthTexture() },
+    stampDepth3:    { value: _fallbackDepthTexture() },
     boundsMin:       { value: new THREE.Vector3() },
     boundsSize:       { value: new THREE.Vector3(1, 1, 1) },
     boundsCenter:     { value: new THREE.Vector3() },
@@ -730,6 +800,18 @@ function _fallbackTexture() {
   const t = new THREE.CanvasTexture(canvas);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   _fallback = t;
+  return t;
+}
+
+// One shared 1×1 float texture for stamp-depth slots without a map (never sampled: layerStampDepth.x = 0).
+let _fallbackDepth = null;
+function _fallbackDepthTexture() {
+  if (_fallbackDepth) return _fallbackDepth;
+  const t = new THREE.DataTexture(new Float32Array([-1e30]), 1, 1, THREE.RedFormat, THREE.FloatType);
+  t.minFilter = THREE.NearestFilter;
+  t.magFilter = THREE.NearestFilter;
+  t.needsUpdate = true;
+  _fallbackDepth = t;
   return t;
 }
 

@@ -82,6 +82,8 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
  *   hardFaces  Uint8Array|null    per-triangle flag: fully untextured by the
  *              layer's hard mask (their positions pin the layer's boundary)
  *   blendAdd   boolean            add to the layers below instead of covering them
+ *   stampDepth object|null        a stamp layer's occlusion depth map
+ *              (mapping.js buildStampDepth): only the surface nearest the stamp gets it
  *   legacy     boolean            read the mask from the geometry's
  *              excludeWeight / softExclude attributes instead
  * @param {object} settings  global settings (bottomAngleLimit, topAngleLimit,
@@ -477,6 +479,7 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
     // normal (a crease group's own normal), so the cut-off follows the real
     // surface instead of bleeding past hard edges.
     const stamp = isStampActive(lset) ? stampFrame(settingsWithAspect, bounds) : null;
+    if (stamp && layer.stampDepth) stamp.depth = layer.stampDepth;   // occlusion (mapping.js buildStampDepth)
     const dispCacheCov = stamp ? new Float64Array(uniqueCount) : null;
     const groupCov = stamp && creases ? new Float64Array(creases.groupCount) : null;
 
