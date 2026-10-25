@@ -4,7 +4,7 @@
  */
 
 import * as THREE from 'three';
-import { scaleMmToRelative } from './mapping.js';
+import { scaleMmToRelative, isStampActive, stampFrame } from './mapping.js';
 
 // Mapping mode constants (must match index.html <option value="…">)
 export const MODE_PLANAR_XY   = 0;
@@ -60,6 +60,9 @@ const sharedGLSL = /* glsl */`
   uniform int       layerSymmetric[MAX_LAYERS];
   uniform vec2      layerAspect[MAX_LAYERS];
   uniform int       layerAdd[MAX_LAYERS];
+  uniform vec4      layerStamp[MAX_LAYERS];     // stamp: xyz = centre (model mm), w = facing side ±1; w = 0 → tiled
+  uniform vec4      layerStampSize[MAX_LAYERS]; // stamp: xy = footprint (mm), zw = height map size (texels)
+  uniform vec2      layerStampFade[MAX_LAYERS]; // stamp: x = Smooth Mask distance (mm), y = curve (FALLOFF_CURVE_INDEX)
   uniform vec3      boundsMin;
   uniform vec3      boundsSize;
   uniform vec3      boundsCenter;
@@ -114,13 +117,7 @@ const sharedGLSL = /* glsl */`
     return blendedWeights / (dot(blendedWeights, vec3(1.0)) + 1e-6);
   }
 
-  // Sample layer l after applying scale + tiling (aspect-corrected)
-  float sampleMap(int l, vec2 rawUV) {
-    vec2 uv = (rawUV * layerAspect[l]) / layerScale[l] + layerOffset[l];
-    float c = cos(layerRot[l]); float s = sin(layerRot[l]);
-    uv -= 0.5;
-    uv  = vec2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
-    uv += 0.5;
+  float sampleTex(int l, vec2 uv) {
     float h = 0.0;
     if      (l == 0) h = texture2D(map0, uv).r;
     else if (l == 1) h = texture2D(map1, uv).r;
@@ -129,10 +126,81 @@ const sharedGLSL = /* glsl */`
     return h;
   }
 
+  // Sample layer l after applying scale + tiling (aspect-corrected)
+  float sampleMap(int l, vec2 rawUV) {
+    vec2 uv = (rawUV * layerAspect[l]) / layerScale[l] + layerOffset[l];
+    float c = cos(layerRot[l]); float s = sin(layerRot[l]);
+    uv -= 0.5;
+    uv  = vec2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
+    uv += 0.5;
+    return sampleTex(l, uv);
+  }
+
+  // Stamp ("place once") — mirrors stampUV in mapping.js. Returns the
+  // unwrapped stamp UV in xy and the facing (cosine to the stamp axis on the
+  // stamp side) in z.
+  const float STAMP_FACING_LO = 0.15;
+  const float STAMP_FACING_HI = 0.30;
+  vec3 stampFrame(int l, vec3 pos, vec3 n) {
+    vec4 st = layerStamp[l];
+    float side = st.w;
+    int mode = layerMode[l];
+    vec2 d;
+    float facing;
+    if (mode == 0) {
+      d = pos.xy - st.xy; facing = n.z * side;
+      if (side < 0.0) d.x = -d.x;
+    } else if (mode == 1) {
+      d = pos.xz - st.xz; facing = n.y * side;
+      if (side > 0.0) d.x = -d.x;
+    } else if (mode == 2) {
+      d = pos.yz - st.yz; facing = n.x * side;
+      if (side < 0.0) d.x = -d.x;
+    } else {
+      vec2 rp = pos.xy - layerCylCenter[l];
+      vec2 rc = st.xy - layerCylCenter[l];
+      float dth = atan(rc.x * rp.y - rc.y * rp.x, dot(rc, rp));
+      d = vec2(dth * max(layerCylRadius[l], 1e-4), pos.z - st.z);
+      float lp = length(rp);
+      facing = lp > 1e-6 ? dot(n.xy, rp / lp) * side : 0.0;
+      if (side < 0.0) d.x = -d.x;
+    }
+    facing /= max(length(n), 1e-6);
+    float c = cos(layerRot[l]); float s = sin(layerRot[l]);
+    d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+    return vec3(d / layerStampSize[l].xy + 0.5, facing);
+  }
+
+  // Layer l's coverage: 1 for tiled layers; for a stamp, its footprint times
+  // the facing fade, ramping up from the footprint's edge with a Smooth Mask.
+  float stampCover(int l, vec3 pos, vec3 n) {
+    if (layerStamp[l].w == 0.0) return 1.0;
+    vec3 f = stampFrame(l, pos, n);
+    if (f.x < 0.0 || f.x > 1.0 || f.y < 0.0 || f.y > 1.0) return 0.0;
+    float cover = smoothstep(STAMP_FACING_LO, STAMP_FACING_HI, f.z);
+    float fade = layerStampFade[l].x;
+    if (fade > 0.0) {
+      vec2 size = layerStampSize[l].xy;
+      float edge = min(min(f.x, 1.0 - f.x) * size.x, min(f.y, 1.0 - f.y) * size.y);
+      float t = min(1.0, edge / fade);
+      float curve = layerStampFade[l].y;
+      if      (curve == 1.0) t = t * t * (3.0 - 2.0 * t);
+      else if (curve == 2.0) t = t * t;
+      cover *= t;
+    }
+    return cover;
+  }
+
   // Compute layer l's raw height (0..1 grey) at a world-space point.
   // projN  = face-stable projection normal (for axis selection)
   // blendN = smooth / interpolated normal  (for blend weights)
   float computeHeightAtPoint(int l, vec3 pos, vec3 projN, vec3 blendN) {
+    if (layerStamp[l].w != 0.0) {
+      // Clamp half a texel inside the image so the bilinear blend never
+      // wraps the opposite border in (same as _stampGrey in displacement.js).
+      vec2 halfTexel = 0.5 / layerStampSize[l].zw;
+      return sampleTex(l, clamp(stampFrame(l, pos, projN).xy, halfTexel, 1.0 - halfTexel));
+    }
     int mappingMode = layerMode[l];
     float mappingBlend = layerBlend[l];
     float seamBandWidth = layerSeamBand[l];
@@ -246,12 +314,13 @@ const sharedGLSL = /* glsl */`
   }
 
   // Composite the layers' heights with per-layer weights w (mask × falloff ×
-  // angle mask): later layers cover the ones below, or add to them.
+  // angle mask, times a stamp's coverage): later layers cover the ones
+  // below, or add to them.
   float compositeHeight(vec3 pos, vec3 projN, vec3 blendN, vec4 w) {
     float H = 0.0;
     for (int l = 0; l < MAX_LAYERS; l++) {
       if (l >= layerCount) break;
-      float wl = w[l];
+      float wl = w[l] * stampCover(l, pos, projN);
       float hl = layerHeightMm(l, pos, projN, blendN) * wl;
       if (layerAdd[l] == 1) H += hl;
       else H = H * (1.0 - wl) + hl;
@@ -353,6 +422,9 @@ const fragmentShader = /* glsl */`
   // weighted by wl) into the running bump sums with the over/add recurrence.
   void bumpLayer(int l, vec3 PN, float wl, inout float dhx, inout float dhy, inout float coverSum) {
     float hRaw = computeHeightAtPoint(l, vModelPos, PN, vModelNormal);
+    // A stamp's coverage uses the attribute face normal: its orientation is
+    // the mesh's, whereas PN's sign follows the screen-space derivatives.
+    wl *= stampCover(l, vModelPos, vModelNormal);
     float gx = dFdx(hRaw) * layerAmp[l];
     float gy = dFdy(hRaw) * layerAmp[l];
     if (layerAdd[l] == 1) {
@@ -532,7 +604,9 @@ export function createPreviewMaterial(layers, settings) {
  *   (at most MAX_LAYERS), each: { texture, mappingMode, scaleU, scaleV,
  *   offsetU, offsetV, rotation, amplitude, symmetricDisplacement,
  *   mappingBlend, seamBandWidth, capAngle, cylinderCenterX, cylinderCenterY,
- *   cylinderRadius, textureAspectU, textureAspectV, blendAdd }
+ *   cylinderRadius, textureAspectU, textureAspectV, blendAdd, stampOnce,
+ *   stampCenterX/Y/Z, stampSide, mapWidth, mapHeight (height map texels),
+ *   boundaryFalloff, boundaryFalloffCurve (the stamp's edge fade) }
  * @param {object} settings  { bounds, bottomAngleLimit, topAngleLimit,
  *   noDownwardZ, useDisplacement, activeLayer (index into `layers`),
  *   boundaryFalloff, boundaryFalloffCurve (the active layer's, for the
@@ -575,6 +649,17 @@ export function updateMaterial(material, layers, settings) {
     u.layerAspect.value[l * 2]     = L ? (L.textureAspectU ?? 1) : 1;
     u.layerAspect.value[l * 2 + 1] = L ? (L.textureAspectV ?? 1) : 1;
     u.layerAdd.value[l]        = L && L.blendAdd ? 1 : 0;
+    const st = L && isStampActive(L) ? stampFrame(L, b) : null;
+    u.layerStamp.value[l * 4]     = st ? st.cx : 0;
+    u.layerStamp.value[l * 4 + 1] = st ? st.cy : 0;
+    u.layerStamp.value[l * 4 + 2] = st ? st.cz : 0;
+    u.layerStamp.value[l * 4 + 3] = st ? st.side : 0;
+    u.layerStampSize.value[l * 4]     = st ? st.sizeU : 1;
+    u.layerStampSize.value[l * 4 + 1] = st ? st.sizeV : 1;
+    u.layerStampSize.value[l * 4 + 2] = L ? Math.max(L.mapWidth ?? 1, 1) : 1;
+    u.layerStampSize.value[l * 4 + 3] = L ? Math.max(L.mapHeight ?? 1, 1) : 1;
+    u.layerStampFade.value[l * 2]     = st ? st.fade : 0;
+    u.layerStampFade.value[l * 2 + 1] = st ? (FALLOFF_CURVE_INDEX[st.fadeCurve] ?? 0) : 0;
   }
   u.boundsMin.value.copy(b.min);
   u.boundsSize.value.copy(b.size);
@@ -611,7 +696,10 @@ function buildUniforms() {
     layerSymmetric: { value: new Int32Array(MAX_LAYERS) },
     layerAspect:    { value: new Float32Array(MAX_LAYERS * 2) },
     layerAdd:       { value: new Int32Array(MAX_LAYERS) },
-    boundsMin:        { value: new THREE.Vector3() },
+    layerStamp:     { value: new Float32Array(MAX_LAYERS * 4) },
+    layerStampSize: { value: new Float32Array(MAX_LAYERS * 4) },
+    layerStampFade: { value: new Float32Array(MAX_LAYERS * 2) },
+    boundsMin:       { value: new THREE.Vector3() },
     boundsSize:       { value: new THREE.Vector3(1, 1, 1) },
     boundsCenter:     { value: new THREE.Vector3() },
     bottomAngleLimit: { value: 5.0 },

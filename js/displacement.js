@@ -4,7 +4,7 @@
  */
 
 import { THREE } from './threeCompat.js';
-import { computeUV, getDominantCubicAxis, getCubicBlendWeights, scaleMmToRelative } from './mapping.js';
+import { computeUV, getDominantCubicAxis, getCubicBlendWeights, scaleMmToRelative, isStampActive, stampFrame, stampUV } from './mapping.js';
 import { QuantizedPointMap } from './meshIndex.js';
 
 // ── Sharp-crease handling (see _findCreases / _creaseMoves) ─────────────────
@@ -471,6 +471,15 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
     const dispCacheSet = new Uint8Array(uniqueCount);
     const groupGrey = creases ? new Float64Array(creases.groupCount) : null;
 
+    // Stamp layer: one image, no tiling. Coverage (footprint × facing) is
+    // sampled alongside the grey and scales both the displacement and how
+    // much the layer covers the ones below. Facing uses the unsmoothed
+    // normal (a crease group's own normal), so the cut-off follows the real
+    // surface instead of bleeding past hard edges.
+    const stamp = isStampActive(lset) ? stampFrame(settingsWithAspect, bounds) : null;
+    const dispCacheCov = stamp ? new Float64Array(uniqueCount) : null;
+    const groupCov = stamp && creases ? new Float64Array(creases.groupCount) : null;
+
     const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
     const relScale = scaleMmToRelative(6, lset, bounds);
     const rotRad = (lset.rotation ?? 0) * Math.PI / 180;
@@ -495,7 +504,12 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
         for (let g = 0; g < creases.groups[slot]; g++) {
           const k = creases.start[slot] + g;
           const node = _groupNode(creases, uniqueCount, slot, g);
-          if (lset.mappingMode === 6 /* MODE_CUBIC */) {
+          if (stamp) {
+            tmpNrm.set(initX[node], initY[node], initZ[node]);
+            const st = stampUV(tmpPos, tmpNrm, stamp);
+            groupGrey[k] = _stampGrey(imageData.data, imgWidth, imgHeight, st);
+            groupCov[k] = st.cover;
+          } else if (lset.mappingMode === 6 /* MODE_CUBIC */) {
             const w = getCubicBlendWeights(
               { x: blendNrmX[node], y: blendNrmY[node], z: blendNrmZ[node] }, cubicBlend, cubicBandWidth);
             groupGrey[k] = cubicGrey(w.x, w.y, w.z, creases.nrmX[k], creases.nrmY[k], creases.nrmZ[k]);
@@ -523,6 +537,14 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
       // normals broadly aligned read ≈1; perfectly cancelling pairs read 0.
       // 0.5 is loose enough that a 90° cube edge (≈0.71) still uses the smooth
       // path, but a near-180° fold falls back to face-area zones.
+      if (stamp) {
+        tmpNrm.set(smoothNrmX[vid], smoothNrmY[vid], smoothNrmZ[vid]);
+        const st = stampUV(tmpPos, tmpNrm, stamp);
+        dispCacheVal[vid] = _stampGrey(imageData.data, imgWidth, imgHeight, st);
+        dispCacheCov[vid] = st.cover;
+        continue;
+      }
+
       if (lset.mappingMode === 6 /* MODE_CUBIC */) {
         let wX = 0, wY = 0, wZ = 0;
         if (smoothNrmReliability[vid] > 0.5) {
@@ -576,13 +598,15 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
       const falloffFactor = falloffArr ? falloffArr[vid] : 1.0;
       let disp = pinned ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * amplitude;
       if (softMax) disp *= 1 - softMax[vid];
+      if (dispCacheCov) disp *= dispCacheCov[vid];
       if (li === 0) {
         acc[vid] = disp;
       } else if (blendAdd) {
         acc[vid] += disp;
       } else {
         // "Over": where this layer covers, the layers below fade out.
-        const cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+        let cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+        if (dispCacheCov) cover *= dispCacheCov[vid];
         acc[vid] = acc[vid] * (1 - cover) + disp;
       }
     }
@@ -601,12 +625,14 @@ export function applyDisplacementLayers(geometry, layers, settings, bounds, onPr
           const centeredGrey = symmetric ? (groupGrey[k] - 0.5) : groupGrey[k];
           let disp = pinned ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * amplitude;
           if (softMax) disp *= 1 - softMax[vid];
+          if (groupCov) disp *= groupCov[k];
           if (li === 0) {
             groupAcc[k] = disp;
           } else if (blendAdd) {
             groupAcc[k] += disp;
           } else {
-            const cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+            let cover = pinned ? 0 : (softMax ? 1 - softMax[vid] : 1);
+            if (groupCov) cover *= groupCov[k];
             groupAcc[k] = groupAcc[k] * (1 - cover) + disp;
           }
         }
@@ -979,6 +1005,18 @@ function _cubicGrey(data, w, h, pos, wX, wY, wZ, fx, fy, fz, bounds, md, relScal
     grey += sampleBilinear(data, w, h, uv.u, uv.v) * wZ;
   }
   return grey;
+}
+
+/**
+ * Stamp grey at a stampUV result. The UV is clamped half a texel inside the
+ * image (clamp-to-edge), so the bilinear blend never wraps the stamp's
+ * opposite border in; the shader clamps the same way.
+ */
+function _stampGrey(data, w, h, st) {
+  const hu = 0.5 / w, hv = 0.5 / h;
+  return sampleBilinear(data, w, h,
+    Math.min(Math.max(st.u, hu), 1 - hu),
+    Math.min(Math.max(st.v, hv), 1 - hv));
 }
 
 /** Every other mode: computeUV (mapping.js) with `nrm` as the blend normal. */

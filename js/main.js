@@ -33,7 +33,7 @@ import { PaintTree } from './paintTree.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions } from './meshValidation.js';
 import { t, tHtml, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
-import { getScaleReferenceLengths } from './mapping.js';
+import { getScaleReferenceLengths, isStampActive, stampFrame, stampUV, stampUntouchedFaces } from './mapping.js';
 import { QuantizedPointMap } from './meshIndex.js';
 import { APP_VERSION } from './version.js';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
@@ -93,6 +93,11 @@ let maskModeChosen     = false;       // false until the user (or a loaded/seede
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
 let _lastHoverKey      = '';          // Standard circle brush: erase flag + faces of the last hover preview
 let placeOnFaceActive  = false;       // true while "Place on Face" mode is active
+let stampPlaceActive   = false;       // true while the next click on the model places the stamp
+let _stampDragging     = false;       // true from a stamp press until release (the stamp follows the cursor)
+let _stampGrab         = null;        // grab offset while dragging the patch itself (null = centre follows the cursor)
+let _stampWheelArmed   = false;       // after a stamp press: the wheel resizes the stamp until the next press elsewhere
+let _stampHoverCursor  = false;       // the 'move' cursor is showing over the stamp's patch
 let rotateActive       = false;       // true while rotate mode is active
 let rotateAngles       = { x: 0, y: 0, z: 0 };  // accumulated rotation in degrees
 let _rotateOriginalPositions = null;  // Float32Array snapshot before any rotation
@@ -154,6 +159,15 @@ const settings = {
   cylinderCenterY:  null,
   cylinderRadius:   null,
   cylinderPanelMinimized: false,
+  // Stamp ("place once", planar and cylindrical modes): the image appears
+  // once, centred on a picked surface point (model mm; null = bounds centre),
+  // on the surfaces facing stampSide (±1 along the projection axis; null =
+  // the mode's unmirrored side). See mapping.js stampFrame.
+  stampOnce:    false,
+  stampCenterX: null,
+  stampCenterY: null,
+  stampCenterZ: null,
+  stampSide:    null,
   // Regularize Mesh.  Two-step pipeline applied after the initial subdivide:
   // collapse sliver chains, then re-subdivide stretched edges back to a
   // multiple of refineLength.  Always on with these standard values — the
@@ -187,6 +201,7 @@ const LAYER_KEYS = [
   'symmetricDisplacement', 'mappingBlend', 'seamBandWidth', 'capAngle',
   'boundaryFalloff', 'boundaryFalloffCurve',
   'snapSeamlessWrap', 'cylinderCenterX', 'cylinderCenterY', 'cylinderRadius',
+  'stampOnce', 'stampCenterX', 'stampCenterY', 'stampCenterZ', 'stampSide',
 ];
 let layers = [];        // layer records, composition order (first = bottom); see _newLayer
 let activeLayer = 0;    // index into `layers` of the layer the sidebar edits
@@ -402,6 +417,10 @@ const cylinderResetBtn       = document.getElementById('cylinder-reset-btn');
 const cylinderPanel          = document.getElementById('cylinder-panel');
 const cylinderCanvas         = document.getElementById('cylinder-canvas');
 const cylinderPanelMinimize  = document.getElementById('cylinder-panel-minimize');
+const stampModeBtn           = document.getElementById('stamp-mode-btn');
+const stampPlaceRow          = document.getElementById('stamp-place-row');
+const stampPlaceBtn          = document.getElementById('stamp-place-btn');
+const stampHint              = document.getElementById('stamp-hint');
 const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
 const falloffCurveButtons      = {
@@ -525,8 +544,10 @@ function _currentTextureAspectU() {
 }
 
 // True when the active mapping mode wraps U around the model, so snapping the
-// U scale to integer tile counts can make the wrap seam disappear.
+// U scale to integer tile counts can make the wrap seam disappear. A stamp
+// never wraps — its size is the footprint the user typed.
 function _isSeamlessWrapMode() {
+  if (isStampActive(settings)) return false;
   return settings.mappingMode === 3 /* MODE_CYLINDRICAL */ ||
          settings.mappingMode === 4 /* MODE_SPHERICAL */;
 }
@@ -1557,6 +1578,8 @@ function wireEvents() {
     settings.mappingMode = parseInt(mappingSelect.value, 10);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
     updateCylinderUIVisibility();
+    if (stampPlaceActive && !isStampActive(settings)) toggleStampPlace(false);
+    updateStampUIVisibility();
     // The wrap circumference is mode-specific (cylinder vs sphere equator),
     // so entering a wrap mode with snapping on re-snaps the U scale.
     if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) {
@@ -1572,6 +1595,9 @@ function wireEvents() {
       _applyScaleU(settings.scaleU);
     }
   });
+
+  stampModeBtn.addEventListener('click', () => _setStampMode(!settings.stampOnce));
+  stampPlaceBtn.addEventListener('click', () => toggleStampPlace(!stampPlaceActive));
 
   cylinderAutofitBtn.addEventListener('click', () => {
     if (autoFitCylinderAxis()) {
@@ -1843,6 +1869,7 @@ function wireEvents() {
     if (sectionToggle.checked) {
       if (exclusionTool) setExclusionTool(null);
       if (placeOnFaceActive) togglePlaceOnFace(false);
+      if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
     }
     setSectionView(sectionToggle.checked);
     sectionControls.classList.toggle('hidden', !sectionToggle.checked);
@@ -1988,10 +2015,37 @@ function wireEvents() {
 
   // ── Canvas mouse events for exclusion painting ────────────────────────────
   canvas.addEventListener('mousedown', (e) => {
+    // Any press that doesn't start a stamp gesture (orbit, pan, painting)
+    // hands the wheel back to zooming.
+    if (e.button !== 0 && _stampWheelArmed) _setStampWheelArmed(false);
     if (!currentGeometry || e.button !== 0) return;
 
     // Rotation gizmo takes priority
     if (isGizmoDragging()) return;
+
+    // Stamp placement: a hit centres the stamp and starts the drag; a miss
+    // falls through to OrbitControls.
+    if (stampPlaceActive) {
+      if (_placeStampAt(e, true)) {
+        e.preventDefault();
+        _startStampDrag();
+      } else {
+        _setStampWheelArmed(false);
+      }
+      return;
+    }
+
+    // Pressing on the stamp's patch grabs it — no tool needed.
+    if (!exclusionTool && !placeOnFaceActive && !rotateActive) {
+      const hit = _stampPatchHit(e);
+      if (hit) {
+        e.preventDefault();
+        _grabStamp(hit);
+        _startStampDrag();
+        return;
+      }
+    }
+    if (_stampWheelArmed) _setStampWheelArmed(false);
 
     // Place on Face mode
     if (placeOnFaceActive) {
@@ -2058,6 +2112,12 @@ function wireEvents() {
         const ev = _pendingHoverEvent;
         if (!ev) return;
         _pendingHoverEvent = null;
+        if (_stampDragging) {
+          // Slide along the surface; the axis stays the one picked on press.
+          if (_placeStampAt(ev, false)) { _syncPreviewMaterial(); requestRender(); }
+          return;
+        }
+        if (currentGeometry) _updateStampHoverCursor(ev);
         if (placeOnFaceActive && currentGeometry) { updatePlaceOnFaceHover(ev); return; }
         if (exclusionTool === 'brush') {
           updateBrushCursor(ev);
@@ -2076,6 +2136,18 @@ function wireEvents() {
     brushCursorEl.style.display = 'none';
   });
 
+  document.addEventListener('mouseup', _endStampDrag);
+
+  // While armed, the wheel resizes the stamp. Captured on the canvas's parent
+  // so the viewer's cursor zoom (a wheel listener on the canvas) never sees it.
+  canvas.parentElement.addEventListener('wheel', (e) => {
+    if (!_stampWheelArmed || e.target !== canvas || !isStampActive(settings)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;   // lines → pixels (Firefox)
+    _scaleStampBy(Math.exp(-dy * 0.0015));
+  }, { capture: true, passive: false });
+
   document.addEventListener('mouseup', () => {
     if (!isPainting) return;
     isPainting = false;
@@ -2093,6 +2165,7 @@ function wireEvents() {
     if (e.key === 'Escape') {
       if (rotateActive) toggleRotateMode(false);
       if (placeOnFaceActive) togglePlaceOnFace(false);
+      if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
       if (exclusionTool) setExclusionTool(null);
       licenseOverlay.classList.add('hidden');
       imprintOverlay.classList.add('hidden');
@@ -2148,6 +2221,7 @@ function setExclusionTool(tool) {
   // Deactivate place-on-face and rotate if an exclusion tool is being activated
   if (exclusionTool && placeOnFaceActive) togglePlaceOnFace(false);
   if (exclusionTool && rotateActive) toggleRotateMode(false);
+  if (exclusionTool && stampPlaceActive) toggleStampPlace(false);
 
   // Activating any masking tool engages the masking UI — highlight the mode
   // the paint will apply under (exclude unless include-only was chosen).
@@ -2710,6 +2784,10 @@ function _previewLayers() {
       cylinderCenterX: s.cylinderCenterX, cylinderCenterY: s.cylinderCenterY, cylinderRadius: s.cylinderRadius,
       textureAspectU: tmax / Math.max(tw, 1), textureAspectV: tmax / Math.max(th, 1),
       blendAdd: index > 0 && L.blendAdd,
+      stampOnce: s.stampOnce, stampSide: s.stampSide,
+      stampCenterX: s.stampCenterX, stampCenterY: s.stampCenterY, stampCenterZ: s.stampCenterZ,
+      mapWidth: tw, mapHeight: th,
+      boundaryFalloff: s.boundaryFalloff, boundaryFalloffCurve: s.boundaryFalloffCurve,
     });
   }
   return { list, activeIdx, count: slots.length };
@@ -2760,7 +2838,10 @@ function _pipelineInputs() {
   const positions = split ? paintFlat.positions : currentGeometry.attributes.position.array;
   const geometry = split ? paintGeometry : currentGeometry;
 
-  if (!split && parts.length === 1 && parts[0].isActive) {
+  // A stamp always takes the layered path: the faces it can't reach join its
+  // hard mask there, so they are neither refined nor (with Preserve
+  // Untextured) touched by regularize and decimation.
+  if (!split && parts.length === 1 && parts[0].isActive && !isStampActive(parts[0].s)) {
     // Legacy inputs from the root paint: hard faces as the excluded set, soft
     // coverage on the welded base vertices.
     const tl = paintTree ? paintTree.layers[_activeSlot()] : null;
@@ -2787,7 +2868,16 @@ function _pipelineInputs() {
   const hardFlags = [];
   const out = [];
   for (const { L, i, s, entry } of parts) {
-    const { cover, hardMasked } = _layerCoverOn(i, geometry);
+    const coverOn = _layerCoverOn(i, geometry);
+    const cover = coverOn.cover;
+    let hardMasked = coverOn.hardMasked;
+    const frame = _stampFrameFor(i);
+    if (frame) {
+      // A copy — _layerCoverOn's flags are cached.
+      const untouched = stampUntouchedFaces(positions, frame);
+      if (hardMasked) for (let t = 0; t < untouched.length; t++) untouched[t] |= hardMasked[t];
+      hardMasked = untouched;
+    }
     hardFlags.push(hardMasked);
     let exclude = null;
     if (cover) {
@@ -3012,6 +3102,242 @@ function _clearShiftLinePreview() {
   }
 }
 
+// ── Stamp placement ──────────────────────────────────────────────────────────
+// A stamp layer (settings.stampOnce, planar/cylindrical modes) shows its image
+// once. Pressing on its patch grabs it: drag to slide it along the surface.
+// "Position on model" (or turning the stamp on) instead centres it on the
+// next press anywhere on the model, with the projection axis and side
+// following the clicked face. After either press the mouse wheel resizes the
+// stamp, until the next press that isn't on the stamp (orbit, pan) hands the
+// wheel back to zooming.
+
+// Stamps work with these projections only (mapping.js isStampActive).
+const STAMP_MODES = new Set([0, 1, 2, 3]);   // Planar XY / XZ / YZ, Cylindrical
+let _modeBeforeStamp = null;   // the tiling projection Stamp mode switched away from, restored when it ends
+
+/**
+ * Stamp mode on/off. Turning it on from a projection that can't stamp
+ * (Triplanar, Cubic, Spherical) switches to Planar — the first click on the
+ * model then picks the axis — and goes straight to placing; turning it off
+ * brings that projection back.
+ */
+function _setStampMode(on) {
+  if (on) {
+    if (!STAMP_MODES.has(settings.mappingMode)) {
+      _modeBeforeStamp = settings.mappingMode;
+      mappingSelect.value = '0';
+      mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    settings.stampOnce = true;
+  } else {
+    settings.stampOnce = false;
+    updateStampUIVisibility();   // re-enables every projection before restoring one
+    if (_modeBeforeStamp != null) {
+      mappingSelect.value = String(_modeBeforeStamp);
+      _modeBeforeStamp = null;
+      mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+  updateStampUIVisibility();
+  toggleStampPlace(isStampActive(settings) && !!currentGeometry);
+  // Back to tiling around a cylinder: re-snap to a seamless wrap.
+  if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) _applyScaleU(settings.scaleU);
+  updatePreview();
+  _autoSaveSettings();   // a button click isn't an input/change event
+}
+
+/** Stamp UI follows the mode: button state, projections it can use, placement and no offsets while on. */
+function updateStampUIVisibility() {
+  const on = isStampActive(settings);
+  stampModeBtn.classList.toggle('active', !!settings.stampOnce);
+  stampModeBtn.setAttribute('aria-pressed', String(!!settings.stampOnce));
+  for (const opt of mappingSelect.options) opt.disabled = !!settings.stampOnce && !STAMP_MODES.has(parseInt(opt.value, 10));
+  stampPlaceRow.style.display = on ? '' : 'none';
+  stampHint.style.display = on ? '' : 'none';
+  offsetUSlider.closest('.form-row').style.display = on ? 'none' : '';
+  offsetVSlider.closest('.form-row').style.display = on ? 'none' : '';
+  cylinderSnapRow.style.display = _isSeamlessWrapMode() ? '' : 'none';
+  if (!on) _setStampWheelArmed(false);
+}
+
+/** While armed the hint lights up, so it's clear why the wheel resizes instead of zooming. */
+function _setStampWheelArmed(armed) {
+  _stampWheelArmed = armed;
+  stampHint.classList.toggle('armed', armed);
+}
+
+/** Leaving placement (Escape, another tool, a new model) also gives the wheel back to zooming. */
+function toggleStampPlace(active) {
+  stampPlaceActive = active;
+  stampPlaceBtn.classList.toggle('active', active);
+  if (active) {
+    if (exclusionTool) setExclusionTool(null);
+    if (placeOnFaceActive) togglePlaceOnFace(false);
+    if (rotateActive) toggleRotateMode(false);
+    canvas.style.cursor = 'crosshair';
+  } else {
+    if (_stampDragging) { _stampDragging = false; _stampGrab = null; getControls().enabled = true; _autoSaveSettings(); }
+    _setStampWheelArmed(false);
+    if (!exclusionTool && !placeOnFaceActive) canvas.style.cursor = '';
+  }
+  setSectionHandlesLocked(!!exclusionTool || placeOnFaceActive || active);
+}
+
+/** The model point under the cursor (model space) and its base face's normal, or null on a miss. */
+function _stampRaycast(e) {
+  const mesh = getCurrentMesh();
+  if (!mesh) return null;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hit = getFrontFaceHit(_raycaster.intersectObject(mesh), mesh);
+  if (!hit) return null;
+  // The base face's normal, not the (possibly displaced) preview face's.
+  const base = _baseFaceOf(hit.faceIndex, mesh.geometry);
+  const fn = triangleFaceNormals;
+  const n = (fn && base >= 0 && base * 3 + 2 < fn.length)
+    ? new THREE.Vector3(fn[base * 3], fn[base * 3 + 1], fn[base * 3 + 2])
+    : hit.face.normal.clone();
+  return { p: mesh.worldToLocal(hit.point.clone()), n };
+}
+
+/** Layer i's stamp placement as the preview and export resolve it, or null when it isn't a stamp. */
+function _stampFrameFor(i) {
+  const L = layers[i];
+  if (!currentBounds || !L) return null;
+  const isActive = i === activeLayer;
+  const s = isActive ? settings : L.settings;
+  if (!isStampActive(s)) return null;
+  const entry = isActive ? getEffectiveMapEntry() : _effectiveMapFor(L.mapEntry, s.textureSmoothing, s.invertTexture);
+  const tw = entry?.width ?? 1, th = entry?.height ?? 1;
+  const tmax = Math.max(tw, th, 1);
+  return stampFrame({ ...s, textureAspectU: tmax / Math.max(tw, 1), textureAspectV: tmax / Math.max(th, 1) }, currentBounds);
+}
+
+/** The active layer's stamp placement, or null when it isn't a visible stamp. */
+function _activeStampFrame() {
+  return layers[activeLayer]?.visible ? _stampFrameFor(activeLayer) : null;
+}
+
+/** The raycast hit when the cursor is over the active stamp's patch, else null. */
+function _stampPatchHit(e) {
+  const frame = _activeStampFrame();
+  if (!frame) return null;
+  const hit = _stampRaycast(e);
+  if (!hit || stampUV(hit.p, hit.n, frame).cover <= 0) return null;
+  return { ...hit, frame };
+}
+
+/**
+ * Remember where on the patch it was grabbed, so dragging keeps that point
+ * under the cursor instead of snapping the centre to it. Cylindrical stamps
+ * keep the angle and height offset around the axis.
+ */
+function _grabStamp(hit) {
+  const f = hit.frame;
+  if (f.mode === 3 /* MODE_CYLINDRICAL */) {
+    _stampGrab = {
+      cyl: true, ccx: f.ccx, ccy: f.ccy,
+      rc: Math.hypot(f.cx - f.ccx, f.cy - f.ccy),
+      dth: Math.atan2(f.cy - f.ccy, f.cx - f.ccx) - Math.atan2(hit.p.y - f.ccy, hit.p.x - f.ccx),
+      dz: f.cz - hit.p.z,
+    };
+  } else {
+    _stampGrab = { dx: f.cx - hit.p.x, dy: f.cy - hit.p.y, dz: f.cz - hit.p.z };
+  }
+}
+
+function _moveStampTo(p) {
+  const g = _stampGrab;
+  let x = p.x, y = p.y, z = p.z;
+  if (g && g.cyl) {
+    const th = Math.atan2(p.y - g.ccy, p.x - g.ccx) + g.dth;
+    x = g.ccx + g.rc * Math.cos(th);
+    y = g.ccy + g.rc * Math.sin(th);
+    z = p.z + g.dz;
+  } else if (g) {
+    x += g.dx; y += g.dy; z += g.dz;
+  }
+  settings.stampCenterX = x;
+  settings.stampCenterY = y;
+  settings.stampCenterZ = z;
+}
+
+function _startStampDrag() {
+  getControls().enabled = false;
+  _stampDragging = true;
+  _setStampWheelArmed(true);
+  _syncPreviewMaterial();
+  requestRender();
+}
+
+/** Resize the stamp by `factor`, keeping its proportions (wheel while armed). */
+function _scaleStampBy(factor) {
+  const clampMm = (v) => Math.max(SCALE_MM_INPUT_MIN, Math.min(SCALE_MM_INPUT_MAX, v));
+  const u = clampMm(settings.scaleU * factor);
+  const v = settings.lockScale ? u : clampMm(settings.scaleV * factor);
+  settings.scaleU = u; scaleUSlider.value = scaleToPos(u); scaleUVal.value = fmtScaleVal(u);
+  settings.scaleV = v; scaleVSlider.value = scaleToPos(v); scaleVVal.value = fmtScaleVal(v);
+  _syncPreviewMaterial();
+  requestRender();
+  clearTimeout(previewDebounce); previewDebounce = setTimeout(updatePreview, 80);
+  _autoSaveSettings();
+  _scheduleUndoCapture();
+}
+
+/** 'move' cursor over the stamp's patch while no tool owns the cursor. */
+function _updateStampHoverCursor(e) {
+  const free = !placeOnFaceActive && !exclusionTool && !stampPlaceActive && !rotateActive && e.buttons === 0;
+  const over = free && !!_stampPatchHit(e);
+  if (over === _stampHoverCursor) return;
+  _stampHoverCursor = over;
+  if (over) canvas.style.cursor = 'move';
+  else if (free) canvas.style.cursor = '';
+}
+
+/**
+ * Centre the stamp on the model point under the cursor. With pickAxis, the
+ * clicked face also chooses the projection: for planar modes the axis its
+ * normal is closest to (switching between XY / XZ / YZ) and the side it
+ * faces; for cylindrical, outside or inside. Returns false on a miss.
+ */
+function _placeStampAt(e, pickAxis) {
+  const hit = _stampRaycast(e);
+  if (!hit) return false;
+  const { p, n } = hit;
+  if (pickAxis) {
+    if (settings.mappingMode === 3 /* MODE_CYLINDRICAL */) {
+      const { cx, cy } = getEffectiveCylinderCenter();
+      const rx = p.x - cx, ry = p.y - cy;
+      const len = Math.hypot(rx, ry);
+      const radial = len > 1e-6 ? (n.x * rx + n.y * ry) / len : 0;
+      // A cap face (no radial component) keeps the current side.
+      if (Math.abs(radial) > 0.2) settings.stampSide = radial > 0 ? 1 : -1;
+    } else {
+      const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+      const mode = (az >= ax && az >= ay) ? 0 : (ay >= ax ? 1 : 2);
+      const along = mode === 0 ? n.z : mode === 1 ? n.y : n.x;
+      settings.stampSide = along >= 0 ? 1 : -1;
+      if (mode !== settings.mappingMode) {
+        mappingSelect.value = String(mode);
+        mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+  }
+  _moveStampTo(p);
+  return true;
+}
+
+/** Release: placement mode (if any) ends, but the wheel stays on the stamp until the next press. */
+function _endStampDrag() {
+  if (!_stampDragging) return;
+  _stampDragging = false;
+  _stampGrab = null;
+  getControls().enabled = true;
+  if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
+  _setStampWheelArmed(true);
+  updatePreview();
+  _autoSaveSettings();
+}
+
 // ── Place on Face ─────────────────────────────────────────────────────────────
 
 function togglePlaceOnFace(active) {
@@ -3024,6 +3350,7 @@ function togglePlaceOnFace(active) {
     if (exclusionTool) setExclusionTool(null);
     // Deactivate rotate mode
     if (rotateActive) toggleRotateMode(false);
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
     canvas.style.cursor = 'crosshair';
   } else {
     if (!exclusionTool) canvas.style.cursor = '';
@@ -3100,6 +3427,7 @@ function handlePlaceOnFaceClick(e) {
   settings.cylinderCenterX = null;
   settings.cylinderCenterY = null;
   settings.cylinderRadius  = null;
+  settings.stampCenterX = settings.stampCenterY = settings.stampCenterZ = null;  // same for the stamp centre
   _cylSilhouetteCanvas = null;
   _cylSilhouetteGeometry = null;
   _cylSilhouetteAnchor = null;
@@ -3183,6 +3511,7 @@ function toggleRotateMode(active) {
     // Deactivate conflicting modes
     if (placeOnFaceActive) togglePlaceOnFace(false);
     if (exclusionTool) setExclusionTool(null);
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
 
     // Snapshot original positions (and the matching pose transform) for reset
     if (currentGeometry) {
@@ -3595,6 +3924,7 @@ function loadDefaultCube() {
   updateMaskModeButtons();
   if (placeOnFaceActive) togglePlaceOnFace(false);
   if (rotateActive) toggleRotateMode(false);
+  if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
   rotateAngles = { x: 0, y: 0, z: 0 };
   rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
   exclBrushBtn.classList.remove('active');
@@ -3782,6 +4112,7 @@ async function handleModelFile(file, stepSettings = null) {
     settings.cylinderCenterX = null;
     settings.cylinderCenterY = null;
     settings.cylinderRadius  = null;
+    settings.stampCenterX = settings.stampCenterY = settings.stampCenterZ = null;  // same for the stamp centre
     _cylSilhouetteCanvas = null;
     _cylSilhouetteGeometry = null;
     _cylSilhouetteAnchor = null;
@@ -3817,6 +4148,7 @@ async function handleModelFile(file, stepSettings = null) {
     updateMaskModeButtons();
     if (placeOnFaceActive) togglePlaceOnFace(false);
     if (rotateActive) toggleRotateMode(false);
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
     rotateAngles = { x: 0, y: 0, z: 0 };
     rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
     exclBrushBtn.classList.remove('active');
@@ -5490,6 +5822,7 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   isPainting    = false;
   if (placeOnFaceActive) togglePlaceOnFace(false);
   if (rotateActive) toggleRotateMode(false);
+  if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
   rotateAngles = { x: 0, y: 0, z: 0 };
   rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
   exclBrushBtn.classList.remove('active');
@@ -5575,6 +5908,8 @@ const PERSISTED_KEYS = [
   // null means "fall back to AABB defaults", which is what fresh loads get.
   'snapSeamlessWrap', 'cylinderCenterX', 'cylinderCenterY', 'cylinderRadius',
   'cylinderPanelMinimized',
+  // Stamp placement; the centre and side are nullable like the cylinder axis.
+  'stampOnce', 'stampCenterX', 'stampCenterY', 'stampCenterZ', 'stampSide',
 ];
 
 // Settings that are NOT per layer (see LAYER_KEYS): resolution, triangle
@@ -5634,6 +5969,11 @@ function _layerSettingsFrom(saved) {
   const out = _layerSettingsSnapshot();
   if (saved && typeof saved === 'object') {
     for (const k of LAYER_KEYS) if (k in saved) out[k] = saved[k];
+    // Layers saved before stamps existed tile — never inherit the live layer's stamp.
+    if (!('stampOnce' in saved)) {
+      out.stampOnce = false;
+      out.stampCenterX = out.stampCenterY = out.stampCenterZ = out.stampSide = null;
+    }
     if (saved.scaleUnit !== 'mm') {
       // Legacy relative scale fractions — convert like applySettingsSnapshot would.
       const m = _migrateSnapshotScaleToMm({ ...out, scaleUnit: saved.scaleUnit });
@@ -5750,6 +6090,8 @@ function applySettingsSnapshot(snap) {
   snap = _migrateSnapshotScaleToMm(snap);
 
   // Mapping mode first — changes cap-angle row visibility and triggers preview.
+  // Stamp mode's option limits are re-applied at the end, for this snapshot.
+  for (const opt of mappingSelect.options) opt.disabled = false;
   if (snap.mappingMode != null) {
     mappingSelect.value = String(snap.mappingMode);
     mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
@@ -5852,6 +6194,17 @@ function applySettingsSnapshot(snap) {
     cylinderPanel.classList.toggle('minimized', settings.cylinderPanelMinimized);
   }
   updateCylinderUIVisibility();
+
+  // Stamp: snapshots from before the feature tile, like they always did.
+  settings.stampOnce    = !!snap.stampOnce;
+  settings.stampCenterX = snap.stampCenterX ?? null;
+  settings.stampCenterY = snap.stampCenterY ?? null;
+  settings.stampCenterZ = snap.stampCenterZ ?? null;
+  settings.stampSide    = snap.stampSide ?? null;
+  _modeBeforeStamp = null;   // that projection belonged to the previous layer / session
+  if (stampPlaceActive && !isStampActive(settings)) toggleStampPlace(false);
+  _setStampWheelArmed(false);   // e.g. another layer: the wheel zooms again
+  updateStampUIVisibility();
 }
 
 /**
@@ -5937,6 +6290,7 @@ const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   snapSeamlessWrap: true,
   cylinderCenterX: null, cylinderCenterY: null, cylinderRadius: null,
   cylinderPanelMinimized: false,
+  stampOnce: false, stampCenterX: null, stampCenterY: null, stampCenterZ: null, stampSide: null,
   activeMapName: DEFAULT_PRESET_NAME,
 });
 

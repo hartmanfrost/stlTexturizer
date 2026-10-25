@@ -600,6 +600,11 @@ main.sidebar-collapsed .gallery-panel { display: none; }
   line-height: 1.4;
 }
 
+/* Lit while the mouse wheel resizes the stamp instead of zooming. */
+.stamp-hint.armed {
+  color: var(--accent);
+}
+
 .advanced-section .panel-subsection-heading:first-of-type {
   margin-top: 6px;
 }
@@ -1681,7 +1686,8 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   color: var(--text);
   cursor: pointer;
 }
-.cylinder-axis-btn:hover {
+.cylinder-axis-btn:hover,
+.cylinder-axis-btn.active {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);

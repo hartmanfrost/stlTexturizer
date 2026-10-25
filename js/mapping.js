@@ -9,6 +9,8 @@
  * a bounds object { min, max, center, size } (all THREE.Vector3).
  */
 
+import { QuantizedPointMap } from './meshIndex.js';
+
 export const MODE_PLANAR_XY   = 0;
 export const MODE_PLANAR_XZ   = 1;
 export const MODE_PLANAR_YZ   = 2;
@@ -360,6 +362,221 @@ export function computeUV(pos, normal, mode, settings, bounds) {
   }
 
   return applyTransform(u, v, scaleU, scaleV, offsetU, offsetV, cosR, sinR);
+}
+
+// ── Stamp ("place once") ─────────────────────────────────────────────────────
+// A stamp layer shows its image exactly once instead of tiling: centred on a
+// picked surface point, sized by scaleU/scaleV (mm, aspect-corrected like a
+// tile), rotated about its centre, and only on surfaces that face the stamp
+// side. Outside that footprint the layer has zero coverage — it neither
+// displaces nor covers the layers below. Mirrored by stampFrame /
+// stampCoverAt in the GLSL of previewMaterial.js.
+
+// Facing fade: coverage ramps from 0 at FACING_LO (≈ 81° from the projection
+// axis) to 1 at FACING_HI (≈ 73°), so the stamp fades out instead of smearing
+// down walls the projection hits edge-on.
+export const STAMP_FACING_LO = 0.15;
+export const STAMP_FACING_HI = 0.30;
+
+/** True when this layer's settings place the image once (planar and cylindrical modes only). */
+export function isStampActive(settings) {
+  return !!settings.stampOnce && settings.mappingMode >= MODE_PLANAR_XY && settings.mappingMode <= MODE_CYLINDRICAL;
+}
+
+/**
+ * Default stamp side per mode: the side each projection shows unmirrored
+ * (top for XY, front (−Y) for XZ, +X for YZ, outside for cylindrical).
+ */
+export function defaultStampSide(mode) {
+  return mode === MODE_PLANAR_XZ ? -1 : 1;
+}
+
+/**
+ * Per-layer stamp placement, resolved once: centre (model mm), facing side,
+ * footprint size (mm), rotation and the cylinder axis. A null centre falls
+ * back to the bounds centre — for cylindrical, the front (−Y) point of the
+ * projection cylinder at mid height.
+ */
+export function stampFrame(settings, bounds) {
+  const mode = settings.mappingMode;
+  const ccx = settings.cylinderCenterX ?? bounds.center.x;
+  const ccy = settings.cylinderCenterY ?? bounds.center.y;
+  const r   = Math.max(settings.cylinderRadius ?? Math.max(bounds.size.x, bounds.size.y) * 0.5, 1e-6);
+  let cx = settings.stampCenterX, cy = settings.stampCenterY, cz = settings.stampCenterZ;
+  if (cx == null || cy == null || cz == null) {
+    cx = bounds.center.x; cy = bounds.center.y; cz = bounds.center.z;
+    if (mode === MODE_CYLINDRICAL) { cx = ccx; cy = ccy - r; }
+  }
+  const side = (settings.stampSide === 1 || settings.stampSide === -1) ? settings.stampSide : defaultStampSide(mode);
+  const rotRad = (settings.rotation ?? 0) * Math.PI / 180;
+  return {
+    mode, cx, cy, cz, side, ccx, ccy, r,
+    sizeU: Math.max(Number(settings.scaleU) || 1e-6, 1e-6) / (settings.textureAspectU ?? 1),
+    sizeV: Math.max(Number(settings.scaleV) || 1e-6, 1e-6) / (settings.textureAspectV ?? 1),
+    cosR: Math.cos(rotRad), sinR: Math.sin(rotRad),
+    // Smooth Mask: the layer's falloff distance (mm) and curve also fade the
+    // stamp's own border.
+    fade: Math.max(Number(settings.boundaryFalloff) || 0, 0),
+    fadeCurve: settings.boundaryFalloffCurve ?? 'linear',
+  };
+}
+
+/** The Smooth Mask ramp shapes — must match applyFalloffCurve in main.js and the shader. */
+function _falloffCurve(t, mode) {
+  if (mode === 'scurve') return t * t * (3 - 2 * t);
+  if (mode === 'ease')   return t * t;
+  return t;
+}
+
+/**
+ * Stamp UV at a point: { u, v } in [0, 1] inside the footprint (not wrapped)
+ * and `cover` in [0, 1] — 0 outside the footprint or on surfaces facing away,
+ * ramping up from the footprint's edge when the layer has a Smooth Mask.
+ * Mirroring follows the triplanar convention, so the image reads correctly
+ * from whichever side it is placed on.
+ */
+export function stampUV(pos, normal, frame) {
+  const ab = _stampAB(pos.x, pos.y, pos.z, frame, _ab);
+  const facing = _stampFacing(normal.x, normal.y, normal.z, pos.x, pos.y, pos.z, frame);
+  const ra = frame.cosR * ab.a - frame.sinR * ab.b;
+  const rb = frame.sinR * ab.a + frame.cosR * ab.b;
+  const u = ra / frame.sizeU + 0.5;
+  const v = rb / frame.sizeV + 0.5;
+  const inside = u >= 0 && u <= 1 && v >= 0 && v <= 1;
+  let cover = 0;
+  if (inside) {
+    const t = Math.max(0, Math.min(1, (facing - STAMP_FACING_LO) / (STAMP_FACING_HI - STAMP_FACING_LO)));
+    cover = t * t * (3 - 2 * t);
+    if (frame.fade > 0) {
+      // Distance (mm) to the nearest footprint edge, in the stamp's own frame.
+      const edge = Math.min(Math.min(u, 1 - u) * frame.sizeU, Math.min(v, 1 - v) * frame.sizeV);
+      cover *= _falloffCurve(Math.min(1, edge / frame.fade), frame.fadeCurve);
+    }
+  }
+  return { u, v, cover };
+}
+
+const _ab = { a: 0, b: 0, dth: 0 };
+
+/**
+ * Stamp-plane coordinates (mm, mirrored for the side, before rotation) of a
+ * point: planar axes, or arc length at the projection radius and height for
+ * cylindrical (dth = angle from the centre, in (−π, π]).
+ */
+function _stampAB(x, y, z, frame, out) {
+  const { mode, side } = frame;
+  let a, b;
+  if (mode === MODE_PLANAR_XY) {
+    a = x - frame.cx; b = y - frame.cy;
+    if (side < 0) a = -a;
+  } else if (mode === MODE_PLANAR_XZ) {
+    a = x - frame.cx; b = z - frame.cz;
+    if (side > 0) a = -a;
+  } else if (mode === MODE_PLANAR_YZ) {
+    a = y - frame.cy; b = z - frame.cz;
+    if (side < 0) a = -a;
+  } else {
+    const rpx = x - frame.ccx, rpy = y - frame.ccy;
+    const rcx = frame.cx - frame.ccx, rcy = frame.cy - frame.ccy;
+    out.dth = Math.atan2(rcx * rpy - rcy * rpx, rcx * rpx + rcy * rpy);
+    a = out.dth * frame.r; b = z - frame.cz;
+    if (side < 0) a = -a;
+  }
+  out.a = a; out.b = b;
+  return out;
+}
+
+/** Cosine between a normal and the stamp axis on the stamp side (outward radial for cylindrical). */
+function _stampFacing(nx, ny, nz, x, y, z, frame) {
+  const { mode, side } = frame;
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  let facing;
+  if (mode === MODE_PLANAR_XY) facing = nz * side;
+  else if (mode === MODE_PLANAR_XZ) facing = ny * side;
+  else if (mode === MODE_PLANAR_YZ) facing = nx * side;
+  else {
+    const rpx = x - frame.ccx, rpy = y - frame.ccy;
+    const lp = Math.hypot(rpx, rpy);
+    facing = lp > 1e-6 ? (nx * rpx + ny * rpy) / lp * side : 0;
+  }
+  return facing / nLen;
+}
+
+/**
+ * Per-triangle flags for a non-indexed position array: 1 where the stamp
+ * cannot cover any point of the triangle, so the export can skip refining it
+ * and Preserve Untextured keeps it as it is. A face counts as reached when
+ * the bounding box of its stamp coordinates overlaps the footprint — widened
+ * by the Smooth Mask distance, so the mask boundary these faces create never
+ * ramps the stamp itself down — and one of its corners touches a face that
+ * points toward the stamp. Faces straddling the cylinder axis or its back
+ * seam count as overlapping. Every corner of an unreached face has zero
+ * coverage (it is outside the footprint, or all its faces point away), so
+ * masking these faces never changes the displacement.
+ */
+export function stampUntouchedFaces(pos, frame) {
+  const triCount = pos.length / 9;
+  const cyl = frame.mode === MODE_CYLINDRICAL;
+  const ab = { a: 0, b: 0, dth: 0 };
+  const cr = frame.cosR, sr = frame.sinR;
+  const margin = frame.fade * 1.25;
+  const mu = margin / frame.sizeU, mv = margin / frame.sizeV;
+
+  // Welded corners; per corner the most stamp-facing of its faces.
+  const welded = new QuantizedPointMap(1e5, Math.min(triCount * 3, 1 << 22));
+  const vid = new Int32Array(triCount * 3);
+  let next = 0;
+  for (let i = 0; i < triCount * 3; i++) {
+    vid[i] = welded.getOrSet(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], next);
+    if (welded.inserted) next++;
+  }
+  const facesToward = new Uint8Array(next);
+  for (let t = 0; t < triCount; t++) {
+    const o = t * 9;
+    const ax = pos[o], ay = pos[o + 1], az = pos[o + 2];
+    const e1x = pos[o + 3] - ax, e1y = pos[o + 4] - ay, e1z = pos[o + 5] - az;
+    const e2x = pos[o + 6] - ax, e2y = pos[o + 7] - ay, e2z = pos[o + 8] - az;
+    const nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+    const facing = _stampFacing(nx, ny, nz,
+      ax + (e1x + e2x) / 3, ay + (e1y + e2y) / 3, az + (e1z + e2z) / 3, frame);
+    if (facing > 0) { facesToward[vid[t * 3]] = 1; facesToward[vid[t * 3 + 1]] = 1; facesToward[vid[t * 3 + 2]] = 1; }
+  }
+
+  const out = new Uint8Array(triCount);
+  for (let t = 0; t < triCount; t++) {
+    if (!facesToward[vid[t * 3]] && !facesToward[vid[t * 3 + 1]] && !facesToward[vid[t * 3 + 2]]) { out[t] = 1; continue; }
+    const o = t * 9;
+    let amin = Infinity, amax = -Infinity, bmin = Infinity, bmax = -Infinity;
+    let thMin = Infinity, thMax = -Infinity;
+    for (let k = 0; k < 3; k++) {
+      _stampAB(pos[o + k * 3], pos[o + k * 3 + 1], pos[o + k * 3 + 2], frame, ab);
+      if (ab.a < amin) amin = ab.a; if (ab.a > amax) amax = ab.a;
+      if (ab.b < bmin) bmin = ab.b; if (ab.b > bmax) bmax = ab.b;
+      if (cyl) { if (ab.dth < thMin) thMin = ab.dth; if (ab.dth > thMax) thMax = ab.dth; }
+    }
+    if (cyl && (thMax - thMin > Math.PI || _triContainsAxis(pos, o, frame.ccx, frame.ccy))) continue;
+    // Rotate the (a, b) box's corners: bounds the face's stamp UV even where
+    // the cylindrical mapping bends its edges.
+    let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity;
+    for (let c = 0; c < 4; c++) {
+      const a = c & 1 ? amax : amin, b = c & 2 ? bmax : bmin;
+      const u = (cr * a - sr * b) / frame.sizeU + 0.5;
+      const v = (sr * a + cr * b) / frame.sizeV + 0.5;
+      if (u < umin) umin = u; if (u > umax) umax = u;
+      if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+    }
+    if (umax < -mu || umin > 1 + mu || vmax < -mv || vmin > 1 + mv) out[t] = 1;
+  }
+  return out;
+}
+
+/** True when the XY projection of triangle o (offset into pos) contains the point (cx, cy). */
+function _triContainsAxis(pos, o, cx, cy) {
+  const d = (x1, y1, x2, y2) => (x2 - x1) * (cy - y1) - (y2 - y1) * (cx - x1);
+  const d1 = d(pos[o], pos[o + 1], pos[o + 3], pos[o + 4]);
+  const d2 = d(pos[o + 3], pos[o + 4], pos[o + 6], pos[o + 7]);
+  const d3 = d(pos[o + 6], pos[o + 7], pos[o], pos[o + 1]);
+  return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
 }
 
 function applyTransform(u, v, scaleU, scaleV, offsetU, offsetV, cosR, sinR) {

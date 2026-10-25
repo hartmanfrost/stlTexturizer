@@ -343,6 +343,23 @@
               title="Reset to AABB center and AABB-derived radius.">Reset</button>
           </div>
         </div>
+        <div class="form-row" id="stamp-mode-row">
+          <div class="cylinder-axis-controls">
+            <button id="stamp-mode-btn" type="button" class="cylinder-axis-btn" aria-pressed="false"
+              data-i18n="ui.stampMode"
+              data-i18n-title="tooltips.stamp"
+              title="Apply the texture once instead of tiling it, for logos, badges and labels. Click the model to position it; Size U and V set its size. Only the Planar and Cylindrical projections are available while it is on.">Stamp mode</button>
+          </div>
+        </div>
+        <div class="form-row" id="stamp-place-row" style="display:none">
+          <div class="cylinder-axis-controls">
+            <button id="stamp-place-btn" type="button" class="cylinder-axis-btn"
+              data-i18n="ui.stampPlace"
+              data-i18n-title="tooltips.stampPlace"
+              title="Click the model to centre the stamp there. Hold and drag to slide it along the surface.">Position on model</button>
+          </div>
+        </div>
+        <p id="stamp-hint" class="advanced-blurb stamp-hint" style="display:none" data-i18n="ui.stampHint">Drag the stamp on the model to move it, then scroll to resize it.</p>
       </section>
 
       <!-- Displacement -->
