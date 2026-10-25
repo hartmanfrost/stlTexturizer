@@ -279,6 +279,20 @@
          the "Latest" badge follows the first entry automatically. -->
     <ol class="timeline" id="timeline">
 
+      <li class="release" id="v1.5.0">
+        <div class="release-meta">
+          <a class="version" href="#v1.5.0">v1.5.0</a>
+          <time datetime="2026-10-25">25 Oct 2026</time>
+        </div>
+        <h2>Stamp mode</h2>
+        <ul>
+          <li><strong>Stamp mode</strong>, under Projection, places a texture once instead of tiling it, for logos, badges and labels. Turn it on and click the model to position the stamp; drag it to move it, and scroll right after to resize it. Size U and V set its size, and Rotation turns it.</li>
+          <li>The new <strong>Surface normal</strong> projection, the default for stamps, lays the stamp flat on the surface under it, even on slopes and curves, and follows the surface as you drag. At an edge it stops instead of flipping onto the next face. Planar and Cylindrical can stamp too.</li>
+          <li>Only the surface facing the stamp gets it, not the parts hidden behind it. Smooth Mask fades the stamp&rsquo;s border.</li>
+          <li>Exports refine only the faces the stamp touches, so they finish faster, and with Preserve Untextured (on by default) the rest of the model keeps its original triangles.</li>
+        </ul>
+      </li>
+
       <li class="release" id="v1.4.3">
         <div class="release-meta">
           <a class="version" href="#v1.4.3">v1.4.3</a>

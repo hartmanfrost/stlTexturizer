@@ -10,18 +10,12 @@ Load an STL, OBJ, 3MF, or STEP file, pick a texture, tune the parameters, and ex
 
 ## Recent Updates
 
-- Roughly 2× more triangles for the same memory — pipeline peak cut from ~660 to ~330 bytes per subdivided triangle, with bit-identical output
-- STEP import (`.step` / `.stp`) via [meshStep](https://github.com/CNCKitchen/meshStep)
-- Save / load project files (`.bumpmesh`)
-- Undo / redo history
-- Part rotation gizmo
-- Mesh diagnostics
-- Smooth masking borders with selectable transition curves (linear, S-curve, ease-in)
-- New languages: Italian, Spanish, Portuguese, Japanese, French
-- 2–3× speed improvement
-- 3MF export
-- Mouse-wheel fine tuning of values
-- Quality of life improvements
+- **Stamp mode** (v1.5) — apply a texture once, like a logo or label, with the new Surface normal projection
+- **Texture layers** (v1.4) — up to four textures on one model, with a circle brush that refines the mesh by itself
+- **3Dconnexion SpaceMouse** support (v1.4.2) and **tire tread** textures (v1.4.3)
+- **Section View** (v1.3.8) — texture and mask the inside of hollow parts
+- **Texture Gallery** with 101 textures and saved custom uploads
+- STEP import, project files, undo / redo, 3MF export and 16 languages
 
 See the **[full changelog](https://bumpmesh.com/changelog.html)** for every update since April 2026.
 
@@ -39,6 +33,8 @@ See the **[full changelog](https://bumpmesh.com/changelog.html)** for every upda
 - **Cylindrical** — wraps texture around a cylindrical axis with configurable cap angle
 - **Spherical** — maps texture spherically around the object
 - **Planar XY / XZ / YZ** — flat axis-aligned projections
+- **Stamp mode** — places the texture once instead of tiling it (logos, badges, labels): click the model to position it, drag to move, scroll to resize; works with Surface normal, Planar and Cylindrical. Only the surface facing the stamp gets it, and exports refine only the faces it touches
+- **Surface normal** (Stamp mode) — projects along the surface under the stamp, so it lies flat on slopes and curves
 
 ### UV & Transform Controls
 - **Scale U/V** — independent or locked scaling (0.05–10×, logarithmic)
